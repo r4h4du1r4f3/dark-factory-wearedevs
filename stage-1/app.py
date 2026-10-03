@@ -173,12 +173,79 @@ def intervals_overlap(a_start, a_end, b_start, b_end):
     return a_start < b_end and b_start < a_end
 
 
+class _HeaderRecorder:
+    """Wrap rfile to record raw request bytes consumed during parse_request."""
+    def __init__(self, rfile):
+        self._rfile = rfile
+        self.recorded = bytearray()
+
+    def readline(self, *args, **kwargs):
+        data = self._rfile.readline(*args, **kwargs)
+        try:
+            self.recorded.extend(data)
+        except Exception:
+            pass
+        return data
+
+    def read(self, *args, **kwargs):
+        return self._rfile.read(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._rfile, name)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Tablekeeper/1.0"
 
     def log_message(self, *args):
         pass
+
+    def parse_request(self):
+        orig = self.rfile
+        rec = _HeaderRecorder(orig)
+        self.rfile = rec
+        try:
+            ok = BaseHTTPRequestHandler.parse_request(self)
+        finally:
+            try:
+                self.rfile = orig
+            except Exception:
+                pass
+            raw = bytes(rec.recorded)
+        # Extract raw Idempotency-Key value (preserve whitespace).
+        # Wire format is "Field: value"; clients send "Idempotency-Key: <key>".
+        # To distinguish empty ("Idempotency-Key: " -> remainder "") from a
+        # single-space key ("Idempotency-Key:   " -> remainder " "), strip
+        # exactly one leading SP/HTAB as the delimiter and keep the rest verbatim.
+        try:
+            self._raw_idem = None
+            self._raw_idem_present = False
+            if raw:
+                parts = raw.split(b"\r\n")
+                # parts[0] is request line; headers follow until empty line
+                for line in parts[1:]:
+                    if line == b"":
+                        break
+                    if line[:1] in (b" ", b"\t"):
+                        continue  # continuation line
+                    if b":" not in line:
+                        continue
+                    name, _, after = line.partition(b":")
+                    if name.strip().lower() == b"idempotency-key":
+                        try:
+                            s = after.decode("iso-8859-1")
+                        except Exception:
+                            s = ""
+                        if s[:1] in (" ", "\t"):
+                            s = s[1:]
+                        self._raw_idem = s
+                        self._raw_idem_present = True
+                        break
+        except Exception:
+            self._raw_idem = None
+            self._raw_idem_present = False
+        return ok
 
     # ----- plumbing -----
     def send_json(self, status, payload):
@@ -802,15 +869,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- reservations -----
     def check_idem(self, user_id, method, path):
-        k = self.idem_key()
-        if k is None or k == "" or (isinstance(k, str) and k.strip() == "" and k != ""):
-            # treat whitespace-only as missing? spec says absent or empty
-            if k is not None and isinstance(k, str) and k.strip() == "":
+        # Prefer raw header value to preserve whitespace-only keys.
+        # BaseHTTPRequestHandler strips whitespace-only values to "", so use
+        # the raw bytes captured in parse_request: absent -> missing, "" ->
+        # missing, 1..255 (including whitespace-only) -> valid, >255 -> invalid.
+        if getattr(self, "_raw_idem_present", False):
+            k = self._raw_idem
+            if k is None or k == "":
                 return ("missing", None, None)
+            if len(k) > 255:
+                return ("invalid", k, None)
+            return ("ok", k, None)
+        # Fallback when raw capture unavailable (should not happen normally).
+        k = self.idem_key()
+        if k is None or k == "":
             return ("missing", None, None)
-        if not isinstance(k, str):
-            return ("missing", None, None)
-        if len(k) < 1 or len(k) > 255:
+        if len(k) > 255:
             return ("invalid", k, None)
         return ("ok", k, None)
 
